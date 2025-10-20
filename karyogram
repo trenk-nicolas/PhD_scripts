@@ -1,0 +1,197 @@
+# Create a gene-level karyogram using gggenes from a GFF3 genome annotation
+# and optional point annotations (e.g., SNPs, variants, domains).
+#
+# Author: Nicolas Trenk
+# GitHub: https://github.com/trenk-nicolas/PhD_scripts/karyogram
+#
+# Dependencies:
+#   ggplot2, gggenes, ggrepel, ape, stringr, dplyr, readr
+#
+# Usage:
+#   Rscript karyogram_gggenes.R \
+#     --gff my_genome.gff3 \
+#     --annotations variants.csv \
+#     --gene_list genes.csv \
+#     --output my_karyogram.pdf
+#
+# Example input files:
+#   genes.csv      → 2 columns: Gene_id, Name
+#   annotations.csv → columns: seqid, Name, name, position, forward, label_pos
+#
+# ------------------------------------------------------------------------------
+
+# ---- Setup ------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(gggenes)
+  library(ggrepel)
+  library(ape)
+  library(stringr)
+  library(dplyr)
+  library(readr)
+  library(optparse)
+})
+
+# ---- Command-line options ----------------------------------------------------
+
+option_list <- list(
+  make_option("--gff", type = "character", help = "Input GFF3 file path", metavar = "FILE"),
+  make_option("--gene_list", type = "character", help = "CSV file with Gene_id and Name", metavar = "FILE"),
+  make_option("--annotations", type = "character", default = NULL, help = "Optional annotations CSV (positions, labels, etc.)", metavar = "FILE"),
+  make_option("--output", type = "character", default = "karyogram.pdf", help = "Output PDF file name", metavar = "FILE")
+)
+
+opt <- parse_args(OptionParser(option_list = option_list))
+
+# Validate inputs
+if (is.null(opt$gff) || is.null(opt$gene_list)) {
+  stop("Error: Both --gff and --gene_list must be provided.")
+}
+
+if (!file.exists(opt$gff)) stop(paste("GFF3 file not found:", opt$gff))
+if (!file.exists(opt$gene_list)) stop(paste("Gene list file not found:", opt$gene_list))
+if (!is.null(opt$annotations) && !file.exists(opt$annotations)) {
+  warning(paste("Annotations file not found:", opt$annotations))
+  opt$annotations <- NULL
+}
+
+# ---- Load Data ---------------------------------------------------------------
+
+message("Reading GFF3 file...")
+gff <- read.gff(opt$gff, na.strings = c(".", "?"), GFF3 = TRUE)
+
+message("Reading gene list...")
+gene_list <- read_csv(opt$gene_list, show_col_types = FALSE)
+
+if (!is.null(opt$annotations)) {
+  message("Reading annotations file...")
+  annotations <- read_csv(opt$annotations, show_col_types = FALSE)
+} else {
+  annotations <- data.frame()
+}
+
+# ---- Process GFF -------------------------------------------------------------
+
+# ---- Process GFF -------------------------------------------------------------
+# This section reshapes and cleans the GFF data to make it suitable for gggenes plotting.
+# It extracts gene IDs, filters for the genes of interest, and computes columns needed
+# by gggenes (e.g., orientation, transcript numbers, exon labels, etc.)
+
+# Extract standardised gene identifiers from the GFF attributes field.
+#    This regex captures IDs such as "Psat.cameor.v2.6g90450" or "XYZ.g12345".
+#    It ensures we can match them to the gene list later.
+gff$gene <- str_extract(
+  gff$attributes,
+  "Psat\\.cameor\\.v2\\.[0-9]+g[[:alnum:]_]+|[A-Za-z0-9_]+\\.g[0-9]+"
+)
+
+# Filter the GFF so we only keep genes present in the provided gene list.
+#    Then add the descriptive 'Name' column from the gene list to the GFF data.
+filtered_gff <- gff %>%
+  semi_join(gene_list, by = c("gene" = "Gene_id")) %>%
+  left_join(gene_list, by = c("gene" = "Gene_id"))
+
+# Prepare numeric and categorical fields used for plotting.
+#    These transformations create columns for gggenes and clarify feature structure.
+filtered_gff <- filtered_gff %>%
+  mutate(
+    # --- Genomic start/end coordinates ---
+    # gggenes uses 'xmin' and 'xmax' aesthetics; we keep 'from'/'to' for clarity.
+    from = start,
+    to = end,
+    
+    # --- Orientation of each gene or feature ---
+    # gggenes expects 1 for forward strand (+) and 0 for reverse (-).
+    # NA if strand information is missing.
+    orientation = case_when(
+      strand == "+" ~ 1,
+      strand == "-" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # --- Subgene number (e.g., exon1, exon2, CDS1, CDS2) ---
+    # Extracts the numeric suffix from tags like "exon3" or "CDS5"
+    # for labelling individual coding segments.
+    subgene = str_extract(attributes, "CDS\\d+|exon\\d+") %>% str_extract("\\d+"),
+    
+    # --- Transcript number ---
+    # Many GFF entries include transcript variants (e.g., gene.1, gene.2, etc.).
+    # We extract the number after the last period.
+    # e.g., "Psat.cameor.v2.6g90000.1" → transcript = 1
+    transcript = str_extract(attributes, "g[0-9]+\\.([0-9]+)") %>%
+      str_extract("[0-9]+$"),
+    
+    # --- UTR type (untranslated regions) ---
+    # Label 5' and 3' UTRs so we can color and annotate them separately in the plot.
+    UTR = case_when(
+      type == "five_prime_UTR" ~ "5'UTR",
+      type == "three_prime_UTR" ~ "3'UTR",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Keep only the main transcript (transcript 1), unless transcript info is missing.
+  filter(transcript == 1 | is.na(transcript))
+
+# ---- Plot --------------------------------------------------------------------
+
+gene_plot <- ggplot(data = filtered_gff, aes(xmin = start, xmax = end, y = seqid, forward = orientation)) +
+  geom_gene_arrow(
+    data = subset(filtered_gff, type == "gene"),
+    arrowhead_height = unit(3, "mm"),
+    arrowhead_width = unit(1, "mm")
+  ) +
+  geom_subgene_arrow(
+    data = subset(filtered_gff, type == "CDS"),
+    aes(xsubmin = start, xsubmax = end, fill = "black"),
+    arrowhead_height = unit(3, "mm"),
+    arrowhead_width = unit(1, "mm")
+  ) +
+  geom_subgene_label(
+    data = subset(filtered_gff, type == "CDS"),
+    aes(xsubmin = start, xsubmax = end, label = subgene),
+    min.size = 0
+  ) +
+  geom_subgene_arrow(
+    data = subset(filtered_gff, type %in% c("five_prime_UTR", "three_prime_UTR")),
+    aes(xsubmin = start, xsubmax = end, fill = UTR, forward = orientation),
+    arrowhead_height = unit(3, "mm"),
+    arrowhead_width = unit(1, "mm")
+  ) +
+  geom_subgene_label(
+    data = subset(filtered_gff, type %in% c("five_prime_UTR", "three_prime_UTR")),
+    aes(xsubmin = start, xsubmax = end, label = UTR),
+    min.size = 0
+  )
+
+# Optional annotation features
+if (nrow(annotations) > 0) {
+  gene_plot <- gene_plot +
+    geom_feature(data = annotations, aes(x = position, y = seqid, forward = forward)) +
+    geom_feature_label(
+      data = subset(annotations, label_pos == "above"),
+      aes(x = position, y = seqid, label = name, forward = forward)
+    ) +
+    geom_feature_label(
+      data = subset(annotations, label_pos == "below"),
+      aes(x = position, y = seqid, label = name, forward = forward),
+      label_height = unit(-16, "mm")
+    )
+}
+
+gene_plot <- gene_plot +
+  facet_wrap(~ Name, scales = "free", ncol = 1) +
+  scale_fill_brewer(palette = "Set3") +
+  coord_cartesian(clip = "off") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "lightblue")
+  ) +
+  labs(y = "Gene", x = "Genomic position (bp)")
+
+# ---- Save --------------------------------------------------------------------
+
+ggsave(opt$output, plot = gene_plot, device = "pdf", width = 10, height = 12, units = "in")
+
+# ------------------------------------------------------------------------------
